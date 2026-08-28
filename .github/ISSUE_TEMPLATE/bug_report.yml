@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a reproducible detection, engine, or click-safety problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove account names and other personal information from screenshots and logs.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit hash.
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Windows and Python versions
+      placeholder: Windows 11 24H2, Python 3.11.9 x64
+    validations:
+      required: true
+  - type: dropdown
+    id: board_size
+    attributes:
+      label: Board size
+      options:
+        - 15x15
+        - 19x19
+        - Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include the target application, expected result, and actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted screenshot or error output
+      description: Drag files here after removing personal or account information.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checks
+      options:
+        - label: I reproduced this outside a ranked, tournament, or otherwise prohibited match.
+          required: true
+        - label: I removed personal information from the attached evidence.
+          required: true
