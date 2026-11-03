@@ -113,7 +113,7 @@ class AutoPlayState:
 
         if self._pending_move is not None:
             if geometry_key != self._pending_geometry:
-                self._blocked_reason = "等待落子确认时棋盘位置发生变化，自动模式已暂停"
+                self._blocked_reason = "等待落子确认时棋盘位置发生变化，自动模式持续识别中（不会自动退出）"
                 return AutoObservation(AutoDecision.ERROR, self._blocked_reason)
             row, col = self._pending_move
             current_key = (signature, geometry_key)
@@ -138,10 +138,13 @@ class AutoPlayState:
                         allowed = False
                 allowed &= opponent_additions <= 1
                 if not allowed:
-                    if self._pending_observation_count >= max(2, self.required_stable_reads):
-                        self._blocked_reason = "落子确认期间出现删除、翻色或多枚额外棋子，自动模式已暂停"
+                    if self._pending_observation_count >= max(3, self.required_stable_reads):
+                        self._blocked_reason = "落子确认期间出现删除、翻色或多枚额外棋子，自动模式持续识别中（不会自动退出）"
                         return AutoObservation(AutoDecision.ERROR, self._blocked_reason)
-                    return AutoObservation(AutoDecision.CLICK_PENDING, "等待落子动画稳定")
+                    return AutoObservation(
+                        AutoDecision.CLICK_PENDING,
+                        f"等待落子动画稳定（{self._pending_observation_count}/3）",
+                    )
                 self._pending_move = None
                 self._pending_player = None
                 self._pending_signature = None
@@ -153,14 +156,20 @@ class AutoPlayState:
                 self._stable_count = 1
                 return AutoObservation(AutoDecision.CLICK_CONFIRMED, "落子已在棋盘上确认")
             if now - self._pending_since > self.click_timeout:
-                self._blocked_reason = "点击后目标格长时间没有出现棋子，自动模式已暂停"
+                self._blocked_reason = "点击后目标格长时间没有出现棋子，自动模式持续识别中（不会自动退出）"
                 return AutoObservation(AutoDecision.ERROR, self._blocked_reason)
             if signature != self._pending_signature:
-                if self._pending_observation_count >= max(2, self.required_stable_reads):
-                    self._blocked_reason = "点击后棋盘发生了意外变化，目标格未出现我方棋子"
+                if self._pending_observation_count >= max(3, self.required_stable_reads):
+                    self._blocked_reason = "点击后棋盘发生了意外变化，目标格未出现我方棋子，自动模式持续识别中（不会自动退出）"
                     return AutoObservation(AutoDecision.ERROR, self._blocked_reason)
-                return AutoObservation(AutoDecision.CLICK_PENDING, "等待落子动画稳定")
-            return AutoObservation(AutoDecision.CLICK_PENDING, "等待游戏确认刚才的落子")
+                return AutoObservation(
+                    AutoDecision.CLICK_PENDING,
+                    f"等待落子动画稳定（{self._pending_observation_count}/3）",
+                )
+            return AutoObservation(
+                AutoDecision.CLICK_PENDING,
+                f"等待游戏确认刚才的落子（{self._pending_observation_count}/3）",
+            )
 
         observation_key = (signature, geometry_key)
         if observation_key == self._last_signature:
@@ -173,7 +182,7 @@ class AutoPlayState:
             return AutoObservation(AutoDecision.WAIT_STABLE, "等待棋盘画面稳定")
         turn = self.turn(board)
         if turn is None:
-            self._blocked_reason = "黑白棋子数量不符合合法回合，自动模式已暂停"
+            self._blocked_reason = "黑白棋子数量不符合合法回合，自动模式持续识别中（不会自动退出）"
             return AutoObservation(AutoDecision.ERROR, self._blocked_reason)
         if turn != player:
             return AutoObservation(AutoDecision.WAIT_TURN, "等待对方落子")

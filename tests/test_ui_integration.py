@@ -84,8 +84,10 @@ class UiIntegrationTests(unittest.TestCase):
         locate_board.assert_not_called()
         self.assertEqual(capture_window.call_count, 2)
         self.assertEqual(read_stones.call_count, 2)
-        click_window.assert_called_once()
-        self.assertEqual(click_window.call_args.kwargs["clicks"], 2)
+        # 单击交点 + 黄色确认按钮 = 每次落子两次 click_window，均为单击。
+        self.assertEqual(click_window.call_count, 2)
+        for call in click_window.call_args_list:
+            self.assertEqual(call.kwargs["clicks"], 1)
 
     @patch("gomoku_assistant.ui.locate_board")
     @patch("gomoku_assistant.ui.click_window")
@@ -120,7 +122,8 @@ class UiIntegrationTests(unittest.TestCase):
             self.app._poll_engine_result()
 
         locate_board.assert_not_called()
-        self.assertEqual(click_window.call_count, 2)
+        # 两次 execute_once 各落一子，单击+确认模式每次两次 click_window。
+        self.assertEqual(click_window.call_count, 4)
         self.assertNotEqual(self.app.auto_state.pending_move, (7, 7))
 
     @patch("gomoku_assistant.ui.locate_board")
@@ -145,7 +148,8 @@ class UiIntegrationTests(unittest.TestCase):
         locate_board.assert_not_called()
         self.assertEqual(capture_window.call_count, 2)
         self.assertEqual(read_stones.call_count, 2)
-        click_window.assert_called_once()
+        # 单击 + 确认按钮 = 每次落子两次 click_window。
+        self.assertEqual(click_window.call_count, 2)
         self.assertEqual(self.app.auto_state.pending_move, (7, 7))
 
     @patch("gomoku_assistant.ui.click_window")

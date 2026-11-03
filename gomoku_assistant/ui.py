@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 from .autoplay import AutoDecision, AutoPlayState
 from .detector import (
     DetectionError,
+    find_confirm_button,
     geometry_from_rect,
     grid_liveness,
     locate_board,
@@ -50,7 +51,7 @@ class GomokuApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.engine = RapfiEngine(think_time_ms=5_000)
-        self.auto_state = AutoPlayState(stable_reads=2, click_timeout=4.0)
+        self.auto_state = AutoPlayState(stable_reads=2, click_timeout=6.0)
         self.scan: ScanResult | None = None
         self.suggestion: MoveAnalysis | None = None
         self._target_hwnd: int | None = None
@@ -68,19 +69,36 @@ class GomokuApp:
         self._engine_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rapfi-search")
         self._engine_future: Future[MoveAnalysis] | None = None
         self._engine_context: tuple[bytes, object | None, int, str] | None = None
+        self._pending_engine_result: tuple[MoveAnalysis, tuple[bytes, object | None, int, str]] | None = None
         self._engine_poll_job: str | None = None
         self._scan_failures = 0
+        self._auto_suspended = False  # 手动框选棋盘期间保持自动模式开启但暂停采样点击
         self._last_click_at = 0.0
         self._f8_was_down = False
+        self._f9_was_down = False
+        self._f10_was_down = False
+        # 确认按钮定位方式：auto=黄色掩膜自动识别；manual=左侧视窗手动点选坐标。
+        self.confirm_source = tk.StringVar(value="auto")
+        self.manual_confirm_xy: tuple[int, int] | None = None
+        self._confirm_point_mode = False
+        self._confirm_dot_id: int | None = None
+        self._confirm_dot_r = 5  # 橙色圆点视窗像素半径（比棋子小一号）
+        self._confirm_restore_auto = False  # 进入选择模式前自动模式是否开启（退出/锁定时恢复）
+        # 执棋颜色自动识别：勾选后由软件接管我执黑/我执白并停用 F9；手动定位执子图标。
+        self.side_auto = tk.BooleanVar(value=False)
+        self._stone_point_mode = False  # 执子图标定位模式
+        self._stone_dot_id: int | None = None
+        self._stone_rect: tuple[int, int, int, int, str] | None = None  # (x0,y0,x1,y1,color) 图像坐标
+        self._stone_restore_auto = False  # 进入执子图标定位前自动模式是否开启（锁定时恢复）
 
         self.board_size = tk.IntVar(value=15)
         self.ai_color = tk.StringVar(value="black")
         self.target_window_text = tk.StringVar(value="正在查找棋局窗口...")
         self.confidence_threshold = tk.DoubleVar(value=0.55)
-        self.click_allowed = tk.BooleanVar(value=False)
-        self.click_twice = tk.BooleanVar(value=True)
+        self.click_allowed = tk.BooleanVar(value=True)  # 允许鼠标点击：软件打开默认开启
+        self.click_mode = tk.StringVar(value="single_confirm")
         self.auto_enabled = tk.BooleanVar(value=False)
-        self.interval_seconds = tk.DoubleVar(value=1.2)
+        self.interval_seconds = tk.DoubleVar(value=0.5)  # 自动模式采样间隔：一秒两次
         self.strength_seconds = tk.StringVar(value="5.0")
         self.status_text = tk.StringVar(value="等待识别棋盘")
         self.stats_text = tk.StringVar(value="黑 0  ·  白 0  ·  当前手：未知")
@@ -95,8 +113,11 @@ class GomokuApp:
 
     def _configure_window(self) -> None:
         self.root.title("五子棋下棋助手")
-        self.root.geometry("1080x720+40+40")
-        self.root.minsize(920, 640)
+        # 竖版主窗口：左侧预览视窗接近小程序窗口比例（≈1.8×宽），
+        # 完整显示窗口截图（含棋盘上下与确认按钮），不裁剪。
+        # 右侧功能区宽度 = 435 * 4/5 = 348，窗口总宽 ≈ 510 + 12 + 348 + 32 ≈ 902。
+        self.root.geometry("902x1020+40+40")
+        self.root.minsize(902, 860)
         self.root.configure(bg=self.COLORS["window"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -140,6 +161,25 @@ class GomokuApp:
             font=("Microsoft YaHei UI", 10, "bold"),
         )
         style.map("Accent.TButton", background=[("active", self.COLORS["accent_active"])])
+        # 紧凑小按钮（定位/复位）：长宽约为默认按钮的 3/4。
+        style.configure("Compact.TButton", padding=(7, 4))
+        # 自动识别并代下开关按钮：关闭=灰，开启=亮灰（接近白）。
+        style.configure(
+            "AutoOff.TButton",
+            background="#909090",
+            foreground="#FFFFFF",
+            padding=(12, 8),
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.map("AutoOff.TButton", background=[("active", "#828282")])
+        style.configure(
+            "AutoOn.TButton",
+            background="#E9E9E9",
+            foreground="#2E2E2E",
+            padding=(12, 8),
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.map("AutoOn.TButton", background=[("active", "#DFDFDF")])
         style.configure(
             "TCheckbutton",
             background=self.COLORS["surface"],
@@ -187,8 +227,18 @@ class GomokuApp:
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
 
-        preview_frame = ttk.Frame(body, style="Panel.TFrame", padding=10)
-        preview_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        # 左右分隔条：预览视窗 | 功能区，鼠标按住可拖动；当前左右宽度即最小可压缩宽度。
+        paned = tk.PanedWindow(
+            body,
+            orient="horizontal",
+            sashwidth=12,
+            sashrelief="flat",
+            bg=self.COLORS["window"],
+        )
+        paned.grid(row=0, column=0, sticky="nsew")
+
+        preview_frame = ttk.Frame(paned, style="Panel.TFrame", padding=10)
+        paned.add(preview_frame, minsize=510)
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
         self.canvas = tk.Canvas(
@@ -200,8 +250,8 @@ class GomokuApp:
         )
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.create_text(
-            320,
-            280,
+            300,
+            480,
             text="尚未识别棋盘\n\n点击“识别屏幕”自动定位",
             fill=self.COLORS["muted"],
             justify="center",
@@ -210,9 +260,10 @@ class GomokuApp:
         self.canvas.bind("<ButtonPress-1>", self._selection_press)
         self.canvas.bind("<B1-Motion>", self._selection_drag)
         self.canvas.bind("<ButtonRelease-1>", self._selection_release)
+        self.canvas.bind("<Motion>", self._confirm_motion)
 
-        controls = ttk.Frame(body, style="Panel.TFrame", padding=16, width=326)
-        controls.grid(row=0, column=1, sticky="ns")
+        controls = ttk.Frame(paned, style="Panel.TFrame", padding=16, width=348)
+        paned.add(controls, minsize=348)
         controls.grid_propagate(False)
         controls.columnconfigure(0, weight=1)
 
@@ -263,7 +314,55 @@ class GomokuApp:
         ).pack(side="left")
         ttk.Radiobutton(
             color_row, text="我执白", variable=self.ai_color, value="white", command=self._player_changed
-        ).pack(side="left", padx=(18, 0))
+        ).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            color_row,
+            text="识别执棋颜色",
+            variable=self.side_auto,
+            command=self._side_auto_changed,
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(color_row, text="定位", style="Compact.TButton", width=4, command=self._start_stone_point_selection).pack(
+            side="left", padx=(4, 0)
+        )
+        row += 1
+        confirm_row = ttk.Frame(controls, style="Panel.TFrame")
+        confirm_row.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(confirm_row, text="确认按钮", style="Muted.TLabel").pack(side="left")
+        ttk.Radiobutton(
+            confirm_row,
+            text="自动识别",
+            variable=self.confirm_source,
+            value="auto",
+            command=self._confirm_source_changed,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(
+            confirm_row,
+            text="手动定位",
+            variable=self.confirm_source,
+            value="manual",
+            command=self._confirm_source_changed,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(confirm_row, text="定位", style="Compact.TButton", width=4, command=self._start_confirm_point_selection).pack(
+            side="left", padx=(8, 0)
+        )
+        row += 1
+        mode_box = ttk.Frame(controls, style="Panel.TFrame")
+        mode_box.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        mode_box.columnconfigure(1, weight=1)
+        ttk.Label(mode_box, text="点击模式", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="nw", pady=(4, 0)
+        )
+        mode_opts = ttk.Frame(mode_box, style="Panel.TFrame")
+        mode_opts.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Radiobutton(
+            mode_opts, text="单击", variable=self.click_mode, value="single"
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            mode_opts, text="同一交点双击", variable=self.click_mode, value="double"
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            mode_opts, text="单击+确认按钮", variable=self.click_mode, value="single_confirm"
+        ).pack(anchor="w")
         row += 1
         strength_row = ttk.Frame(controls, style="Panel.TFrame")
         strength_row.grid(row=row, column=0, sticky="ew", pady=(0, 10))
@@ -277,41 +376,42 @@ class GomokuApp:
                 command=self._strength_changed,
             ).pack(side="left", padx=(8 if value == "0.5" else 4, 0))
         row += 1
-        ttk.Button(controls, text="计算推荐落点", command=self.calculate_move).grid(row=row, column=0, sticky="ew")
-        row += 1
-        ttk.Button(controls, text="执行一次落子", style="Accent.TButton", command=self.execute_once).grid(
-            row=row, column=0, sticky="ew", pady=(8, 0)
+        calc_row = ttk.Frame(controls, style="Panel.TFrame")
+        calc_row.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        calc_row.columnconfigure((0, 1), weight=1)
+        ttk.Button(calc_row, text="计算推荐落点", command=self.calculate_move).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(calc_row, text="执行一次落子", style="Accent.TButton", command=self.execute_once).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
         )
         row += 1
-        ttk.Separator(controls).grid(row=row, column=0, sticky="ew", pady=9)
-        row += 1
-
-        ttk.Label(controls, text="自动控制", font=("Microsoft YaHei UI", 11, "bold")).grid(row=row, column=0, sticky="w")
-        row += 1
-        ttk.Checkbutton(
+        self.auto_toggle_btn = ttk.Button(
             controls,
+            text="自动识别并代下",
+            style="AutoOff.TButton",
+            command=self._toggle_auto_mode,
+        )
+        self.auto_toggle_btn.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        row += 1
+        click_row = ttk.Frame(controls, style="Panel.TFrame")
+        click_row.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        ttk.Checkbutton(
+            click_row,
             text="允许鼠标点击",
             variable=self.click_allowed,
             command=self._click_permission_changed,
-        ).grid(row=row, column=0, sticky="w", pady=(8, 2))
+        ).pack(side="left")
         row += 1
-        ttk.Checkbutton(
-            controls,
-            text="同一交点点击两次确认",
-            variable=self.click_twice,
-        ).grid(row=row, column=0, sticky="w", pady=2)
-        row += 1
-        ttk.Checkbutton(
-            controls,
-            text="自动识别并代下",
-            variable=self.auto_enabled,
-            command=self._auto_changed,
-        ).grid(row=row, column=0, sticky="w", pady=2)
-        row += 1
-        ttk.Label(controls, text="F8：立即关闭自动模式和点击权限", style="Muted.TLabel", wraplength=280).grid(
-            row=row, column=0, sticky="w", pady=(4, 8)
-        )
-        row += 1
+        for tip in (
+            "F8：立即关闭自动模式和点击权限",
+            "F9：切换我执黑/我执白",
+            "F10：开启/关闭自动模式",
+        ):
+            ttk.Label(controls, text=tip, style="Muted.TLabel", wraplength=280).grid(
+                row=row, column=0, sticky="w", pady=(0, 2)
+            )
+            row += 1
 
         threshold_row = ttk.Frame(controls, style="Panel.TFrame")
         threshold_row.grid(row=row, column=0, sticky="ew", pady=(4, 0))
@@ -324,6 +424,16 @@ class GomokuApp:
             variable=self.confidence_threshold,
             orient="horizontal",
         ).grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        ttk.Button(
+            threshold_row,
+            text="复位",
+            style="Compact.TButton",
+            width=4,
+            command=lambda: (
+                self.confidence_threshold.set(0.55),
+                self._set_status("置信度已复位", "最低置信度已恢复默认 0.55。"),
+            ),
+        ).grid(row=0, column=2, padx=(6, 0))
         row += 1
         footer = ttk.Frame(shell, style="App.TFrame")
         footer.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -383,7 +493,13 @@ class GomokuApp:
             self._bind_window(selected)
 
     def _bind_window(self, window: WindowInfo) -> None:
-        self._stop_auto("目标窗口已切换")
+        # 切换目标窗口不再停用自动模式：若自动模式开着，重置状态后保持开启，
+        # 下一轮采样会对新窗口重新识别定位。
+        if self.auto_enabled.get():
+            self.auto_state.reset()
+            self._engine_context = None
+            self._pending_engine_result = None
+            self._scan_failures = 0
         self._target_hwnd = window.hwnd
         self._locked_geometry = None
         self._locked_capture_shape = None
@@ -394,18 +510,35 @@ class GomokuApp:
         self.root.after(80, lambda: self.scan_screen(force_locate=True))
 
     def _board_size_changed(self) -> None:
-        self._stop_auto("棋盘路数已更改")
+        # 路数变更不再停用自动模式：重置状态后保持开启，重新定位识别。
+        if self.auto_enabled.get():
+            self.auto_state.reset()
+            self._engine_context = None
+            self._pending_engine_result = None
+            self._scan_failures = 0
         self._locked_geometry = None
         self._locked_capture_shape = None
         self.scan = None
         self.auto_state.reset()
 
     def _player_changed(self) -> None:
-        self._stop_auto("执棋颜色已更改")
+        # 执棋颜色由软件自动识别控制时：拦截与识别结果不符的手动点击，还原并提示取消勾选。
+        if self.side_auto.get():
+            detected = self._stone_rect[4] if self._stone_rect is not None else None
+            if detected is not None and self.ai_color.get() != detected:
+                self.ai_color.set(detected)  # 还原为软件控制值（值相符后走正常逻辑）
+                self.root.bell()
+                self._set_status("执棋颜色由软件控制", "请先取消勾选“识别执棋颜色”，再手动选择我执黑/我执白。")
+                return
+        # 执棋颜色变更不再停用自动模式：重置状态后保持开启，下一轮按新颜色继续。
+        if self.auto_enabled.get():
+            self.auto_state.reset()
+            self._engine_context = None
+            self._pending_engine_result = None
         self.auto_state.reset()
 
     def _strength_changed(self) -> None:
-        self._stop_auto("Rapfi 棋力档位已更改")
+        # Rapfi 思考档位变更不影响盘面，不重置状态、不停用自动模式。
         self.engine.set_think_time_ms(round(float(self.strength_seconds.get()) * 1000))
 
     @staticmethod
@@ -444,16 +577,22 @@ class GomokuApp:
             tuple(np.rint(geometry.y_lines).astype(int)),
         )
 
-    def _recognition_quality(self) -> float:
+    def _board_quality(self) -> float:
+        """棋盘识别质量：棋盘定位置信度与网格存活度的较小值（滑块原值门槛）。"""
         if self.scan is None:
             return 0.0
-        return float(
-            min(
-                self.scan.geometry.confidence,
-                self.scan.grid_liveness,
-                np.min(self.scan.stone_confidence),
-            )
-        )
+        return float(min(self.scan.geometry.confidence, self.scan.grid_liveness))
+
+    def _stone_threshold(self) -> float:
+        """棋子置信度门槛 = 滑块值 × 0.6，小数位数与滑块值一致。
+
+        棋盘定位 / 网格存活度仍按滑块原值门槛，仅棋子识别门槛放宽到 60%，
+        用于容忍复杂满子局面下个别交点判子偏弱的情况。
+        """
+        slider = self.confidence_threshold.get()
+        text = str(slider)
+        decimals = len(text.split(".")[1]) if "." in text else 0
+        return round(slider * 0.6, decimals)
 
     @staticmethod
     def _turn(board: np.ndarray) -> int | None:
@@ -488,23 +627,31 @@ class GomokuApp:
             self.suggestion = None
             self._show_scan()
             self._update_stats()
+            self._refresh_stone_color()  # 持续识别执棋颜色（颜色变化自动更新并重画方框）
             if liveness < self.GRID_LIVENESS_THRESHOLD:
                 self._set_status(
                     "棋盘网格已失效",
                     f"当前锁定网格存活度 {liveness:.0%}，可能已切换页面、被遮挡或发生平移；为避免误点，已拒绝本次操作。",
                 )
                 return False
-            quality = self._recognition_quality()
-            if quality < self.confidence_threshold.get():
+            board_quality = min(geometry.confidence, liveness)
+            stone_min = float(np.min(stone_confidence))
+            if board_quality < self.confidence_threshold.get():
                 self._set_status(
-                    "识别置信度不足",
-                    f"当前最低识别置信度 {quality:.0%}，低于点击门槛 {self.confidence_threshold.get():.0%}。请重新识别或手动框选。",
+                    "棋盘识别置信度不足",
+                    f"棋盘定位/网格存活度最低 {board_quality:.0%}，低于门槛 {self.confidence_threshold.get():.0%}。请重新识别或手动框选。",
+                )
+                return False
+            if stone_min < self._stone_threshold():
+                self._set_status(
+                    "棋子识别置信度不足",
+                    f"最低交点棋子置信度 {stone_min:.0%}，低于棋子门槛 {self._stone_threshold():.0%}（滑块值的 60%）。请重新识别或手动框选。",
                 )
                 return False
             if not quiet:
                 self._set_status(
                     "棋盘已识别",
-                    f"已锁定目标窗口网格；定位 {geometry.confidence:.0%}，最低交点 {np.min(stone_confidence):.0%}。",
+                    f"已锁定目标窗口网格；定位 {geometry.confidence:.0%}，最低交点 {stone_min:.0%}（棋子门槛 {self._stone_threshold():.0%}）。",
                 )
             return True
         except (DetectionError, OSError, ValueError) as exc:
@@ -518,8 +665,11 @@ class GomokuApp:
 
     def _current_search_board(self) -> tuple[np.ndarray, int] | None:
         assert self.scan is not None
-        if self._recognition_quality() < self.confidence_threshold.get():
+        if self._board_quality() < self.confidence_threshold.get():
             self._set_status("暂不计算", "棋盘定位置信度未达到门槛，请先校准。")
+            return None
+        if np.min(self.scan.stone_confidence) < self._stone_threshold():
+            self._set_status("暂不计算", "棋子置信度未达到门槛（滑块值的 60%），请先校准。")
             return None
         if self.engine.winner(self.scan.board) != EMPTY:
             self._set_status("棋局已结束", "检测到棋盘上已经有五连。")
@@ -576,21 +726,27 @@ class GomokuApp:
         if self.scan.board[move.row, move.col] != EMPTY:
             self._set_status("目标格非空", "识别结果已变化，取消本次点击。")
             return False
-        if float(self.scan.stone_confidence[move.row, move.col]) < self.confidence_threshold.get():
-            self._set_status("目标格识别不可靠", "目标交点置信度不足，取消本次点击。")
+        if float(self.scan.stone_confidence[move.row, move.col]) < self._stone_threshold():
+            self._set_status(
+                "目标格识别不可靠",
+                f"目标交点棋子置信度 {float(self.scan.stone_confidence[move.row, move.col]):.0%} 不足（门槛为滑块值的 60%），取消本次点击。",
+            )
             return False
         if time.monotonic() - self._last_click_at < 0.8:
             self._set_status("点击冷却中", "为防止重复落子，本次请求已拦截。")
             return False
         x, y = self.scan.geometry.screen_point(move.row, move.col)
         try:
-            click_window(
-                self._target_hwnd,
-                x,
-                y,
-                clicks=2 if self.click_twice.get() else 1,
-                cancelled=lambda: key_is_down(0x77),
-            )
+            if self.click_mode.get() == "single_confirm":
+                self._click_single_with_confirm(x, y)
+            else:
+                click_window(
+                    self._target_hwnd,
+                    x,
+                    y,
+                    clicks=2 if self.click_mode.get() == "double" else 1,
+                    cancelled=lambda: key_is_down(0x77),
+                )
         except ClickCancelledError as exc:
             self._stop_auto(str(exc), revoke_click=True)
             return False
@@ -611,9 +767,265 @@ class GomokuApp:
         )
         return True
 
+    def _click_single_with_confirm(self, x: int, y: int) -> None:
+        """Single-click the intersection, then tap the yellow confirm button.
+
+        五子棋达人 commits a move in two taps: the intersection, then a yellow
+        confirm button under the board.  The button is located on the current
+        frame by colour; a relative offset under the board centre is the
+        fallback when the button is not (yet) visible.  The button position is
+        resolved BEFORE clicking the intersection, so a short capture that
+        cannot show the button fails the whole move instead of leaving a
+        half-placed stone.
+        """
+
+        cancel = lambda: key_is_down(0x77)  # noqa: E731
+        screen_btn: tuple[int, int] | None = None
+        if self.scan is not None:
+            geometry = self.scan.geometry
+            # 手动定位：直接使用左侧视窗保存的确认按钮坐标；
+            # 自动识别：黄色掩膜定位，定位失败时回退到棋盘下方固定偏移。
+            if self.confirm_source.get() == "manual" and self.manual_confirm_xy is not None:
+                img_x, img_y = self.manual_confirm_xy
+                if 0 <= img_x < self.scan.image_rgb.shape[1] and 0 <= img_y < self.scan.image_rgb.shape[0]:
+                    btn = (img_x, img_y)
+                else:
+                    raise OSError("手动确认按钮坐标已不在当前截图范围内；请重新点选。")
+            else:
+                btn = find_confirm_button(self.scan.image_rgb, geometry)
+                if btn is None:
+                    fallback_y = int(round(geometry.y_lines[-1] + geometry.spacing * 1.8))
+                    if fallback_y < self.scan.image_rgb.shape[0] - 8:
+                        btn = (
+                            int(round((geometry.x_lines[0] + geometry.x_lines[-1]) / 2.0)),
+                            fallback_y,
+                        )
+            if btn is not None:
+                screen_btn = (
+                    geometry.screen_left + btn[0],
+                    geometry.screen_top + btn[1],
+                )
+        if screen_btn is None:
+            raise OSError("确认按钮不在当前截图范围内，无法完成单击+确认落子；请拉高目标窗口后重试")
+        click_window(self._target_hwnd, x, y, clicks=1, cancelled=cancel)
+        time.sleep(0.15)
+        click_window(self._target_hwnd, screen_btn[0], screen_btn[1], clicks=1, cancelled=cancel)
+
+    def _confirm_source_changed(self) -> None:
+        # 自动识别 <-> 手动定位 切换：切到手动定位后自动进入选择模式。
+        if self.confirm_source.get() == "manual":
+            self._enter_confirm_point_mode()
+        else:
+            self._exit_confirm_point_mode()
+            self._set_status("确认按钮自动识别", "由黄色掩膜在棋盘下方自动定位确认按钮。")
+
+    def _start_confirm_point_selection(self) -> None:
+        # “选择”按钮：切到手动定位并进入选择模式。
+        if self.confirm_source.get() != "manual":
+            self.confirm_source.set("manual")
+        self._enter_confirm_point_mode()
+
+    def _side_auto_changed(self) -> None:
+        # 勾选“识别执棋颜色”：进入执子图标定位模式，软件接管我执黑/我执白；
+        # 取消勾选：退出定位模式，恢复手动选择与 F9。
+        if self.side_auto.get():
+            self._enter_stone_point_mode()
+        else:
+            self._exit_stone_point_mode()
+            # 取消勾选：清除执子图标方框并重画画面（旧方框不残留）。
+            # 用定位时保存的最新截图重画；scan 未生成时也必须重画，否则方框残留。
+            self._stone_rect = None
+            if self._pending_image is not None:
+                self._display_image(self._pending_image, full=True)
+            elif self.scan is not None:
+                self._show_scan()
+            self._set_status("执棋颜色手动选择", "已取消自动识别执棋；我执黑/我执白与 F9 恢复手动控制。")
+
+    def _start_stone_point_selection(self) -> None:
+        # “定位”按钮：未勾选时先勾选（自动进入定位模式），已勾选则重新选点。
+        # 注意 side_auto.set() 不触发 command，必须显式进入定位模式以显示点选光标。
+        if not self.side_auto.get():
+            self.side_auto.set(True)
+        self._enter_stone_point_mode()
+
+    def _enter_stone_point_mode(self) -> None:
+        # 进入执子图标定位模式：与确认按钮点选互斥；截最新帧显示，暂停自动模式，锁定后恢复。
+        # 重新定位时先清除旧方框（上一轮识别结果作废，保存新坐标后重画）。
+        self._exit_confirm_point_mode()
+        self._stone_rect = None
+        try:
+            self._pending_image, self._pending_origin = self._capture_target()
+        except OSError as exc:
+            if self.side_auto.get():
+                self.side_auto.set(False)
+            self._set_status("无法定位执子图标", str(exc))
+            return
+        self._display_image(self._pending_image, full=True)
+        if self.auto_enabled.get():
+            self._stone_restore_auto = True
+            self._stop_auto("正在点选执子图标；锁定后自动恢复。")
+        self._stone_point_mode = True
+        self.canvas.configure(cursor="crosshair")
+        if self._stone_dot_id is None:
+            r = self._confirm_dot_r
+            self._stone_dot_id = self.canvas.create_oval(
+                -r, -r, r, r, fill="#F0A020", outline="#8A5A00", width=2
+            )
+        self._set_status(
+            "请点选执子图标",
+            "已刷新窗口截图并暂停自动模式；把橙色圆点移到左上方执子图标中心左键保存，保存后自动恢复自动模式。",
+        )
+
+    def _exit_stone_point_mode(self) -> bool:
+        """退出执子图标定位模式；若进入前自动模式开启则恢复开启。返回退出后自动模式是否开启。"""
+        self._stone_point_mode = False
+        if self._stone_dot_id is not None:
+            try:
+                self.canvas.delete(self._stone_dot_id)
+            except tk.TclError:
+                pass
+            self._stone_dot_id = None
+        self.canvas.configure(cursor="arrow")
+        if self._stone_restore_auto:
+            self._stone_restore_auto = False
+            if not self.auto_enabled.get():
+                self.auto_enabled.set(True)
+                self._auto_changed()
+        return self.auto_enabled.get()
+
+    @staticmethod
+    def _detect_icon_color(image_rgb: np.ndarray, cx: int, cy: int) -> str:
+        """识别执子图标颜色：统计点击点周围中心核的深色像素占比。
+
+        执子图标为圆形棋子标志：黑子中心深色占比显著（>8%），白子中心无深色。
+        窗口半径按图宽缩放（约图标半径），中心核取 0.7×半径抗边缘干扰。
+        """
+        h, w = image_rgb.shape[:2]
+        r = max(8, int(round(w * 0.028)))
+        core = max(4, int(round(r * 0.7)))
+        x0, x1 = max(0, cx - core), min(w - 1, cx + core)
+        y0, y1 = max(0, cy - core), min(h - 1, cy + core)
+        sub = image_rgb[y0:y1 + 1, x0:x1 + 1].astype(np.float64)
+        gray_v = 0.299 * sub[..., 0] + 0.587 * sub[..., 1] + 0.114 * sub[..., 2]
+        dark_ratio = float((gray_v < 90).mean())
+        return "black" if dark_ratio >= 0.08 else "white"
+
+    def _icon_radius_px(self, image_rgb: np.ndarray) -> int:
+        return max(8, int(round(image_rgb.shape[1] * 0.028)))
+
+    def _draw_stone_rect(self) -> None:
+        # 在视窗上按当前视图变换重画执子图标方框（颜色按识别结果：黑/白）。
+        if self._stone_rect is None or self._view_transform is None:
+            return
+        x0, y0, x1, y1, color = self._stone_rect
+        scale, offset_x, offset_y, source_x, source_y = self._view_transform
+        vx0 = (x0 - source_x) * scale + offset_x
+        vy0 = (y0 - source_y) * scale + offset_y
+        vx1 = (x1 - source_x) * scale + offset_x
+        vy1 = (y1 - source_y) * scale + offset_y
+        outline = "#FFFFFF" if color == "white" else "#000000"
+        self.canvas.create_rectangle(vx0, vy0, vx1, vy1, outline=outline, width=3)
+
+    def _refresh_stone_color(self) -> None:
+        """持续识别执棋颜色：每次识别成功后检测执子图标，颜色变化则自动更新并重画方框。
+
+        仅在“识别执棋颜色”开启且已定位时生效；检测点取方框中心，颜色与当前
+        ai_color 不符时更新 _stone_rect / ai_color 并重置自动状态机（软件接管）。
+        """
+        if not self.side_auto.get() or self._stone_rect is None or self.scan is None:
+            return
+        cx = (self._stone_rect[0] + self._stone_rect[2]) // 2
+        cy = (self._stone_rect[1] + self._stone_rect[3]) // 2
+        color = self._detect_icon_color(self.scan.image_rgb, cx, cy)
+        if color == self.ai_color.get():
+            return
+        x0, y0, x1, y1, _ = self._stone_rect
+        self._stone_rect = (x0, y0, x1, y1, color)
+        self.ai_color.set(color)
+        self._player_changed()  # 重置自动状态机（side_auto 下与识别结果相符，走正常重置）
+        self._show_scan()  # 重画方框（新颜色）
+        label = "我执黑" if color == "black" else "我执白"
+        self._set_status("执棋颜色已自动更新", f"执子图标检测为{label}，执棋颜色已由软件自动更新。")
+
+    def _enter_confirm_point_mode(self) -> None:
+        # 进入选择模式：先截取最新窗口帧显示到视窗（坐标基于最新截图），
+        # 并暂停自动模式，坐标锁定后恢复。
+        self._exit_stone_point_mode()  # 与执子图标点选互斥
+        try:
+            self._pending_image, self._pending_origin = self._capture_target()
+        except OSError as exc:
+            self._set_status("无法进入选择模式", str(exc))
+            return
+        self._display_image(self._pending_image, full=True)
+        if self.auto_enabled.get():
+            self._confirm_restore_auto = True
+            self._stop_auto("正在点选确认按钮坐标；锁定后自动恢复。")
+        self._confirm_point_mode = True
+        self.canvas.configure(cursor="crosshair")
+        if self._confirm_dot_id is None:
+            r = self._confirm_dot_r
+            self._confirm_dot_id = self.canvas.create_oval(
+                -r, -r, r, r, fill="#F0A020", outline="#8A5A00", width=2
+            )
+        self._set_status(
+            "请点选确认按钮",
+            "已刷新窗口截图并暂停自动模式；把橙色圆点移到确认按钮中心左键保存，保存后自动恢复自动模式。",
+        )
+
+    def _exit_confirm_point_mode(self) -> bool:
+        """退出选择模式；若进入前自动模式开启则恢复开启。返回退出后自动模式是否处于开启状态。"""
+        self._confirm_point_mode = False
+        if self._confirm_dot_id is not None:
+            try:
+                self.canvas.delete(self._confirm_dot_id)
+            except tk.TclError:
+                pass
+            self._confirm_dot_id = None
+        self.canvas.configure(cursor="arrow")
+        if self._confirm_restore_auto:
+            self._confirm_restore_auto = False
+            if not self.auto_enabled.get():
+                self.auto_enabled.set(True)
+                self._auto_changed()
+        return self.auto_enabled.get()
+
+    def _confirm_motion(self, event: tk.Event) -> None:
+        # 确认按钮点选与执子图标点选共用橙色圆点跟随（画布被 _display_image 清空后重建）。
+        dot_id = None
+        if self._confirm_point_mode:
+            dot_id = self._confirm_dot_id
+        elif self._stone_point_mode:
+            dot_id = self._stone_dot_id
+        if dot_id is None:
+            return
+        r = self._confirm_dot_r
+        try:
+            self.canvas.coords(dot_id, event.x - r, event.y - r, event.x + r, event.y + r)
+        except tk.TclError:
+            new_id = self.canvas.create_oval(
+                event.x - r, event.y - r, event.x + r, event.y + r,
+                fill="#F0A020", outline="#8A5A00", width=2,
+            )
+            if self._confirm_point_mode:
+                self._confirm_dot_id = new_id
+            else:
+                self._stone_dot_id = new_id
+
     def begin_manual_selection(self) -> None:
-        self._stop_auto("正在手动框选棋盘")
-        self.auto_state.reset()
+        # 手动框选与确认按钮/执子图标点选互斥：进入框选前退出点选模式。
+        self._exit_confirm_point_mode()
+        self._exit_stone_point_mode()
+        # 手动框选棋盘不再停用自动模式：仅暂停采样点击，框选完成后自动恢复。
+        if self.auto_enabled.get():
+            self.auto_state.reset()
+            self._engine_context = None
+            self._pending_engine_result = None
+            self._scan_failures = 0
+            self._auto_suspended = True
+            self._set_status("正在手动框选棋盘", "自动模式保持开启；框选并识别通过后自动恢复点击。")
+        else:
+            self.auto_state.reset()
+            self._set_status("正在手动框选棋盘", "在左侧截图上从棋盘左上角拖到右下角；范围应包含完整网格。")
         try:
             self._pending_image, self._pending_origin = self._capture_target()
         except OSError as exc:
@@ -624,9 +1036,50 @@ class GomokuApp:
         self.suggestion = None
         self.canvas.configure(cursor="crosshair")
         self._display_image(self._pending_image, full=True)
-        self._set_status("拖框选择棋盘", "在左侧截图上从棋盘左上角拖到右下角；范围应包含完整网格。")
+        if self._auto_suspended:
+            self._set_status("拖框选择棋盘", "在左侧截图上从棋盘左上角拖到右下角；自动模式保持开启，框选完成且识别通过后自动恢复点击。")
+        else:
+            self._set_status("拖框选择棋盘", "在左侧截图上从棋盘左上角拖到右下角；范围应包含完整网格。")
 
     def _selection_press(self, event: tk.Event) -> None:
+        if self._stone_point_mode:
+            # 执子图标定位模式：左键保存坐标并识别执棋颜色，软件接管我执黑/我执白。
+            if self._view_transform is None or self._pending_image is None:
+                return
+            img_x, img_y = self._canvas_to_image(event.x, event.y)
+            color = self._detect_icon_color(self._pending_image, img_x, img_y)
+            r = self._icon_radius_px(self._pending_image)
+            self._stone_rect = (img_x - r, img_y - r, img_x + r, img_y + r, color)
+            self._exit_stone_point_mode()
+            self.ai_color.set(color)  # 软件接管执棋颜色（触发 _player_changed 重置状态）
+            self._draw_stone_rect()
+            label = "我执黑" if color == "black" else "我执白"
+            self._set_status(
+                f"已识别执棋：{label}",
+                f"执子图标已用{'黑色' if color == 'black' else '白色'}方框标注；执棋颜色由软件控制，取消勾选后可手动选择。",
+            )
+            return
+        if self._confirm_point_mode:
+            # 选择模式：左键即保存确认按钮坐标（视窗坐标 -> 图像坐标）。
+            if self._view_transform is None:
+                return
+            img_x, img_y = self._canvas_to_image(event.x, event.y)
+            self.manual_confirm_xy = (img_x, img_y)
+            r = self._confirm_dot_r
+            if self._confirm_dot_id is not None:
+                try:
+                    self.canvas.coords(
+                        self._confirm_dot_id, event.x - r, event.y - r, event.x + r, event.y + r
+                    )
+                except tk.TclError:
+                    self._confirm_dot_id = None
+            auto_on = self._exit_confirm_point_mode()
+            self._set_status(
+                "确认按钮坐标已保存",
+                f"手动坐标 ({img_x}, {img_y})；单击+确认将直接点击此处。"
+                + ("自动模式已恢复运行。" if auto_on else "自动模式保持关闭。"),
+            )
+            return
         if not self._selecting:
             return
         self._selection_start = (event.x, event.y)
@@ -688,6 +1141,11 @@ class GomokuApp:
         finally:
             self._selection_start = None
             self._selection_id = None
+            # 框选结束（无论成功与否）恢复自动采样；自动模式保持开启。
+            if self._auto_suspended:
+                self._auto_suspended = False
+                if self.auto_enabled.get() and self._auto_job is None:
+                    self._schedule_auto(80)
 
     def _annotated_image(self) -> np.ndarray:
         assert self.scan is not None
@@ -717,7 +1175,8 @@ class GomokuApp:
 
     def _show_scan(self) -> None:
         if self.scan is not None:
-            self._display_image(self._annotated_image(), geometry=self.scan.geometry)
+            # 完整显示窗口截图（含棋盘上下与确认按钮），不裁剪为棋盘特写。
+            self._display_image(self._annotated_image(), full=True)
 
     def _display_image(self, image_rgb: np.ndarray, geometry: BoardGeometry | None = None, full: bool = False) -> None:
         self.root.update_idletasks()
@@ -744,31 +1203,56 @@ class GomokuApp:
         self.canvas.delete("all")
         self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self._photo)
         self._view_transform = (scale, offset_x, offset_y, source_x, source_y)
+        self._draw_stone_rect()  # 画面刷新后持续标注执子图标方框（黑/白）
 
     def _click_permission_changed(self) -> None:
-        if not self.click_allowed.get():
-            self._stop_auto("鼠标点击权限已关闭")
+        # 关闭点击权限不再停用自动模式：自动保持开启，仅不执行点击，重新勾选后自动恢复。
         state = "已开启" if self.click_allowed.get() else "已关闭"
-        self._set_status(f"鼠标点击{state}")
+        if not self.click_allowed.get() and self.auto_enabled.get():
+            self._set_status(f"鼠标点击{state}", "自动模式保持运行但不会执行点击；重新勾选“允许鼠标点击”后自动恢复。")
+        else:
+            self._set_status(f"鼠标点击{state}")
+
+    def _update_auto_button(self) -> None:
+        # 自动识别并代下开关按钮颜色：关闭=灰，开启=亮灰（接近白）。
+        if not hasattr(self, "auto_toggle_btn"):
+            return
+        self.auto_toggle_btn.configure(
+            style="AutoOn.TButton" if self.auto_enabled.get() else "AutoOff.TButton"
+        )
 
     def _auto_changed(self) -> None:
         if self.auto_enabled.get() and not self.click_allowed.get():
             self.auto_enabled.set(False)
             self.root.bell()
+            self._update_auto_button()
             self._set_status("无法开启自动模式", "必须先开启“允许鼠标点击”。")
             return
         if self.auto_enabled.get():
             if self._target_hwnd is None:
                 self.auto_enabled.set(False)
+                self._update_auto_button()
                 self._set_status("无法开启自动模式", "请先选择棋局窗口。")
                 return
             self.auto_state.reset()
             self._scan_failures = 0
+            self._update_auto_button()
             self._set_status("自动模式已启动", "仅在识别可靠且轮到你方时点击；按 F8 可立即停止。")
             self._schedule_auto(80)
         else:
             self.auto_state.reset()
+            self._update_auto_button()
             self._set_status("自动模式已停止")
+
+    def _toggle_auto_mode(self) -> None:
+        # F10：开启/关闭自动模式。复用 _auto_changed 的完整校验与启动/停止逻辑，
+        # 开启失败（未开点击权限 / 未选窗口）时由 _auto_changed 回滚勾选并提示。
+        if not self.auto_enabled.get() and not self.click_allowed.get():
+            self.root.bell()
+            self._set_status("无法开启自动模式", "必须先开启“允许鼠标点击”。")
+            return
+        self.auto_enabled.set(not self.auto_enabled.get())
+        self._auto_changed()
 
     def _stop_auto(self, reason: str, *, reset_state: bool = True, revoke_click: bool = False) -> None:
         self.auto_enabled.set(False)
@@ -781,9 +1265,11 @@ class GomokuApp:
                 pass
             self._auto_job = None
         self._engine_context = None
+        self._pending_engine_result = None
         if reset_state:
             self.auto_state.reset()
         self._scan_failures = 0
+        self._update_auto_button()
         self._set_status("自动模式已停止", reason)
 
     def _schedule_auto(self, delay_ms: int | None = None) -> None:
@@ -844,7 +1330,11 @@ class GomokuApp:
         except (ValueError, RapfiError) as exc:
             action = context[3] if context is not None else None
             if action == "auto" and self.auto_enabled.get():
-                self._stop_auto(f"强引擎计算失败：{exc}", reset_state=False)
+                # 引擎计算失败不再停用自动模式：丢弃本次结果，继续采样识别，
+                # 盘面稳定且轮到我方时下一轮会自动重试计算。
+                self._pending_engine_result = None
+                self._set_status("强引擎计算失败", f"{exc}。将持续识别，盘面稳定后自动重试计算。")
+                self._resume_auto_after_engine(80)
             elif action is not None:
                 self._set_status("强引擎计算失败", f"{exc}。为避免弱棋或误点，本次不会使用旧引擎代替。")
                 self._resume_auto_after_engine()
@@ -852,7 +1342,10 @@ class GomokuApp:
         except Exception as exc:
             action = context[3] if context is not None else None
             if action == "auto" and self.auto_enabled.get():
-                self._stop_auto(f"强引擎线程异常：{exc}", reset_state=False)
+                # 引擎线程异常同样不再停用自动模式，继续采样识别等待恢复。
+                self._pending_engine_result = None
+                self._set_status("强引擎线程异常", f"{exc}。将持续识别，盘面稳定后自动重试计算。")
+                self._resume_auto_after_engine(80)
             elif action is not None:
                 self._set_status("强引擎线程异常", str(exc))
                 self._resume_auto_after_engine()
@@ -861,6 +1354,21 @@ class GomokuApp:
         if context is None:
             self._resume_auto_after_engine()
             return
+        self._deliver_engine_result(move, context)
+
+    def _deliver_engine_result(
+        self,
+        move: MoveAnalysis,
+        context: tuple[bytes, object | None, int, str],
+    ) -> None:
+        """Turn a finished engine result into a confirmed board check and a click.
+
+        Re-confirming the board after Rapfi finishes may fail for a moment
+        (capture glitches / black blocks).  In auto mode the result is parked
+        and retried by the next 0.5 s sampling tick, up to 3 consecutive
+        failures, instead of aborting the auto mode on the first miss.
+        """
+
         signature, geometry_key, player, action = context
         if action == "auto" and (not self.auto_enabled.get() or not self.click_allowed.get()):
             return
@@ -870,14 +1378,26 @@ class GomokuApp:
             return
         if player != self._player():
             if action == "auto":
-                self._stop_auto("思考期间执棋颜色发生变化。")
+                # 思考期间执棋颜色变化不再停用自动模式：丢弃旧落点，重置状态后继续识别。
+                self.auto_state.reset()
+                self._pending_engine_result = None
+                self._set_status("执棋颜色已变化", "Rapfi 思考期间执棋颜色被更改；旧落点已丢弃，将持续识别。")
+                self._resume_auto_after_engine(80)
             else:
                 self._set_status("已丢弃旧落点", "思考期间执棋颜色发生变化。")
                 self._resume_auto_after_engine()
             return
         if not self.scan_screen(quiet=True) or self.scan is None:
             if action == "auto":
-                self._stop_auto("Rapfi 思考完成后无法重新确认棋盘。")
+                # 确认棋盘失败不再停用自动模式：暂存落点结果，由后续采样循环无限重试，
+                # 直到能重新确认棋盘为止（持续重新识别窗口）。
+                self._scan_failures += 1
+                self._pending_engine_result = (move, context)
+                self._set_status(
+                    "等待重新识别",
+                    f"Rapfi 已算好落点，棋盘暂时无法确认（已重试 {self._scan_failures} 次），将持续重试。",
+                )
+                self._resume_auto_after_engine(80)
             else:
                 self._set_status("已丢弃旧落点", "Rapfi 思考完成后无法重新确认棋盘。")
                 self._resume_auto_after_engine()
@@ -902,7 +1422,9 @@ class GomokuApp:
             return
         if not self._click_current_move(move):
             if action == "auto":
-                self._stop_auto("强引擎落点未能安全点击。", reset_state=False)
+                # 落点被拦截（权限/盘面变化/冷却等）不再停用自动模式：继续采样识别，等待下一机会。
+                self._set_status("落点未能安全点击", "本次落点被安全拦截，将持续识别等待下一机会。")
+                self._resume_auto_after_engine(80)
             else:
                 self._resume_auto_after_engine()
             return
@@ -913,21 +1435,25 @@ class GomokuApp:
 
     def _auto_tick(self) -> None:
         self._auto_job = None
-        if not self.auto_enabled.get():
-            return
-        if not self.click_allowed.get():
-            self._stop_auto("点击权限已关闭。")
-            return
         try:
+            if not self.auto_enabled.get():
+                return  # 仅手动关闭勾选 / F8 会走到这里，采样循环随之停止
+            if self._auto_suspended:
+                return  # 手动框选棋盘期间暂停采样点击，循环保持运行，框选完成后恢复
+            if not self.click_allowed.get():
+                return  # 点击权限关闭时保持采样但不点击，也不停用自动模式，恢复后自动续点
             valid = self.scan_screen(quiet=True)
             if not valid or self.scan is None:
+                # 识别失败不再停用自动模式：持续重新识别窗口，直到恢复。
                 self._scan_failures += 1
-                if self._scan_failures >= 3:
-                    self._stop_auto("连续三次无法可靠识别棋盘。请检查目标窗口和预览。")
-                    return
-                self._set_status("等待重新识别", f"识别暂时失败 {self._scan_failures}/3，未执行点击。")
+                self._set_status("等待重新识别", f"识别暂时失败（已重试 {self._scan_failures} 次），将持续重试。")
                 return
             self._scan_failures = 0
+            if self._pending_engine_result is not None:
+                move, context = self._pending_engine_result
+                self._pending_engine_result = None
+                self._deliver_engine_result(move, context)
+                return
             observation = self.auto_state.observe(
                 self.scan.board,
                 self._player(),
@@ -935,7 +1461,11 @@ class GomokuApp:
                 self._geometry_key(),
             )
             if observation.decision == AutoDecision.ERROR:
-                self._stop_auto(observation.message, reset_state=False)
+                # 盘面校验异常（棋子计数/落子确认等）不再停用自动模式：
+                # 重置状态后继续采样，等待盘面恢复正常。
+                self.auto_state.reset()
+                self._pending_engine_result = None
+                self._set_status("盘面校验异常", f"{observation.message}；将持续识别等待盘面恢复。")
                 return
             if observation.decision == AutoDecision.READY:
                 self._start_auto_search()
@@ -949,9 +1479,14 @@ class GomokuApp:
             else:
                 self._set_status("棋盘稳定检查", observation.message)
         except Exception as exc:
-            self._stop_auto(f"自动循环异常：{exc}", reset_state=False)
+            # 自动循环异常不再停用自动模式：丢弃暂存结果，继续采样识别。
+            self._pending_engine_result = None
+            self._set_status("自动循环异常", f"{exc}；将持续尝试重新识别。")
         finally:
-            if self.auto_enabled.get() and self._auto_job is None and self._engine_future is None:
+            # Keep sampling at the configured rate (0.5 s) even while Rapfi is
+            # thinking, so a capture glitch right after the search finishes can
+            # be recovered by the next tick instead of stalling the loop.
+            if self.auto_enabled.get() and self._auto_job is None:
                 self._schedule_auto()
 
     def _poll_emergency_key(self) -> None:
@@ -959,7 +1494,26 @@ class GomokuApp:
         if down and not self._f8_was_down:
             self._stop_auto("F8 急停已触发；自动模式和鼠标点击权限均已关闭。", revoke_click=True)
         self._f8_was_down = down
+        toggle = key_is_down(0x78)  # F9：切换我执黑/白
+        if toggle and not self._f9_was_down:
+            self._toggle_player()
+        self._f9_was_down = toggle
+        toggle10 = key_is_down(0x79)  # F10：开启/关闭自动模式
+        if toggle10 and not self._f10_was_down:
+            self._toggle_auto_mode()
+        self._f10_was_down = toggle10
         self.root.after(80, self._poll_emergency_key)
+
+    def _toggle_player(self) -> None:
+        if self.side_auto.get():
+            # F9 在“识别执棋颜色”开启时停用：执棋颜色完全由软件控制。
+            self._set_status("F9 已停用", "执棋颜色由软件自动识别控制；请先取消勾选“识别执棋颜色”。")
+            return
+        new_color = "white" if self.ai_color.get() == "black" else "black"
+        self.ai_color.set(new_color)
+        self._player_changed()
+        label = "我执黑" if new_color == "black" else "我执白"
+        self._set_status("执棋已切换", f"F9：已切换为{label}；自动模式保持运行。")
 
     def close(self) -> None:
         self._stop_auto("窗口已关闭", revoke_click=True)

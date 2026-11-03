@@ -29,7 +29,7 @@ class AutoPlayTests(unittest.TestCase):
         board[7, 7] = BLACK
         self.assertEqual(state.observe(board, BLACK, 0.3).decision, AutoDecision.CLICK_CONFIRMED)
 
-    def test_unexpected_change_fails_closed(self) -> None:
+    def test_unexpected_change_fails_closed_after_three_reads(self) -> None:
         state = AutoPlayState(stable_reads=1)
         board = np.zeros((15, 15), dtype=np.int8)
         state.observe(board, BLACK, 0)
@@ -37,10 +37,11 @@ class AutoPlayTests(unittest.TestCase):
         changed = board.copy()
         changed[5, 5] = BLACK
         self.assertEqual(state.observe(changed, BLACK, 0.2).decision, AutoDecision.CLICK_PENDING)
-        result = state.observe(changed, BLACK, 0.3)
+        self.assertEqual(state.observe(changed, BLACK, 0.3).decision, AutoDecision.CLICK_PENDING)
+        result = state.observe(changed, BLACK, 0.4)
         self.assertEqual(result.decision, AutoDecision.ERROR)
 
-    def test_target_plus_extra_own_stone_fails_closed(self) -> None:
+    def test_target_plus_extra_own_stone_fails_closed_after_three_reads(self) -> None:
         state = AutoPlayState(stable_reads=1)
         board = np.zeros((15, 15), dtype=np.int8)
         state.observe(board, BLACK, 0)
@@ -49,7 +50,8 @@ class AutoPlayTests(unittest.TestCase):
         changed[7, 7] = BLACK
         changed[6, 6] = BLACK
         self.assertEqual(state.observe(changed, BLACK, 0.2).decision, AutoDecision.CLICK_PENDING)
-        self.assertEqual(state.observe(changed, BLACK, 0.3).decision, AutoDecision.ERROR)
+        self.assertEqual(state.observe(changed, BLACK, 0.3).decision, AutoDecision.CLICK_PENDING)
+        self.assertEqual(state.observe(changed, BLACK, 0.4).decision, AutoDecision.ERROR)
 
     def test_target_plus_one_fast_opponent_reply_is_confirmed(self) -> None:
         state = AutoPlayState(stable_reads=1)
