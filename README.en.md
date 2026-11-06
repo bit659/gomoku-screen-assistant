@@ -64,14 +64,12 @@ contexts.
 
 ```powershell
 $env:PYTHONPATH = (Get-Location).Path
-py -3.11 -m unittest discover -s tests -v
-py -3.11 -m compileall -q app.py gomoku_assistant tests
+py -3.11 -m compileall -q app.py gomoku_assistant
 py -3.11 app.py --smoke-test
 ```
 
-The tests launch the bundled Rapfi executable and cover 15x15/19x19 protocol
-behavior, black/white perspective, immediate wins, grid displacement, uniform
-frames, click confirmation, and emergency-stop behavior.
+The development test suite (`tests/`) has been removed from this release; the
+command above only performs a startup self-check.
 
 ## Licensing
 

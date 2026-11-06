@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import os
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -22,6 +23,12 @@ from .detector import (
 from .engine import BLACK, EMPTY, WHITE, MoveAnalysis
 from .models import BoardGeometry, ScanResult
 from .rapfi import RapfiEngine, RapfiError
+from .template_matcher import (
+    TemplateLibrary,
+    load_template_package,
+    make_square_box,
+    read_board_template,
+)
 from .windows import (
     ClickCancelledError,
     WindowInfo,
@@ -95,6 +102,17 @@ class GomokuApp:
         self.ai_color = tk.StringVar(value="black")
         self.target_window_text = tk.StringVar(value="正在查找棋局窗口...")
         self.confidence_threshold = tk.DoubleVar(value=0.55)
+        # 识别方式：template=OpenCV 多模板匹配（默认主识别）/ color=颜色阈值分割（保留原路径）。
+        self.recognition_mode = tk.StringVar(value="color")
+        self.template_lib: TemplateLibrary | None = None
+        self.template_folder_text = tk.StringVar(value="未导入")
+        self.template_status_text = tk.StringVar(value="模板参数：")
+        # 点击式拉框状态（第一部分机制移植）：两击定正方形 + 贯穿十字线 + 方向键微调 + 回车选角。
+        self._selection_anchor: tuple[float, float] | None = None
+        self._selection_square: tuple[int, int, int, int] | None = None
+        self._selection_cursor: tuple[float, float] | None = None
+        self._xhair_h: int | None = None
+        self._xhair_v: int | None = None
         self.click_allowed = tk.BooleanVar(value=True)  # 允许鼠标点击：软件打开默认开启
         self.click_mode = tk.StringVar(value="single_confirm")
         self.auto_enabled = tk.BooleanVar(value=False)
@@ -116,7 +134,7 @@ class GomokuApp:
         # 竖版主窗口：左侧预览视窗接近小程序窗口比例（≈1.8×宽），
         # 完整显示窗口截图（含棋盘上下与确认按钮），不裁剪。
         # 右侧功能区宽度 = 435 * 4/5 = 348，窗口总宽 ≈ 510 + 12 + 348 + 32 ≈ 902。
-        self.root.geometry("902x1020+40+40")
+        self.root.geometry("902x990+40+40")
         self.root.minsize(902, 860)
         self.root.configure(bg=self.COLORS["window"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -261,6 +279,12 @@ class GomokuApp:
         self.canvas.bind("<B1-Motion>", self._selection_drag)
         self.canvas.bind("<ButtonRelease-1>", self._selection_release)
         self.canvas.bind("<Motion>", self._confirm_motion)
+        # 点击式拉框：方向键微调逻辑光标、回车等效左键（与第一部分机制一致）。
+        self.canvas.bind("<KeyPress-Left>", self._selection_key)
+        self.canvas.bind("<KeyPress-Right>", self._selection_key)
+        self.canvas.bind("<KeyPress-Up>", self._selection_key)
+        self.canvas.bind("<KeyPress-Down>", self._selection_key)
+        self.canvas.bind("<KeyPress-Return>", self._selection_return)
 
         controls = ttk.Frame(paned, style="Panel.TFrame", padding=16, width=348)
         paned.add(controls, minsize=348)
@@ -301,6 +325,46 @@ class GomokuApp:
         ttk.Radiobutton(
             size_row, text="19", variable=self.board_size, value=19, command=self._board_size_changed
         ).pack(side="left", padx=4)
+        row += 1
+        ttk.Separator(controls).grid(row=row, column=0, sticky="ew", pady=9)
+        row += 1
+
+        ttk.Label(controls, text="图像识别", font=("Microsoft YaHei UI", 11, "bold")).grid(row=row, column=0, sticky="w")
+        row += 1
+        recog_row = ttk.Frame(controls, style="Panel.TFrame")
+        recog_row.grid(row=row, column=0, sticky="ew", pady=(8, 6))
+        ttk.Label(recog_row, text="识别方式", style="Muted.TLabel").pack(side="left")
+        ttk.Radiobutton(
+            recog_row,
+            text="模板匹配",
+            variable=self.recognition_mode,
+            value="template",
+            command=self._recognition_mode_changed,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(
+            recog_row,
+            text="颜色阈值",
+            variable=self.recognition_mode,
+            value="color",
+            command=self._recognition_mode_changed,
+        ).pack(side="left", padx=(8, 0))
+        row += 1
+        import_row = ttk.Frame(controls, style="Panel.TFrame")
+        import_row.grid(row=row, column=0, sticky="ew", pady=(0, 6))
+        import_row.columnconfigure(1, weight=1)
+        ttk.Button(import_row, text="导入模板文件夹", command=self._import_template_package).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(import_row, textvariable=self.template_folder_text, style="Muted.TLabel", wraplength=210).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
+        )
+        row += 1
+        ttk.Label(
+            controls,
+            textvariable=self.template_status_text,
+            style="Muted.TLabel",
+            wraplength=300,
+        ).grid(row=row, column=0, sticky="w", pady=(0, 4))
         row += 1
         ttk.Separator(controls).grid(row=row, column=0, sticky="ew", pady=9)
         row += 1
@@ -622,7 +686,7 @@ class GomokuApp:
                 self._locked_capture_shape = capture_shape
             geometry = with_screen_origin(self._locked_geometry, origin)
             liveness = grid_liveness(image_rgb, geometry)
-            board, stone_confidence = read_stones(image_rgb, geometry)
+            board, stone_confidence = self._read_board(image_rgb, geometry)
             self.scan = ScanResult(image_rgb, geometry, board, stone_confidence, liveness)
             self.suggestion = None
             self._show_scan()
@@ -657,6 +721,63 @@ class GomokuApp:
         except (DetectionError, OSError, ValueError) as exc:
             self._set_status("自动识别失败" if quiet else "识别失败", str(exc))
             return False
+
+    def _read_board(self, image_rgb: np.ndarray, geometry) -> tuple[np.ndarray, np.ndarray]:
+        """按当前识别方式读取棋盘。
+
+        默认“模板匹配”：已导入参照图包时走 read_board_template；
+        未导入时自动回退颜色阈值 read_stones（保持原识别能力可用）。
+        “颜色阈值”为保留路径：显式切换到该方式后始终走 read_stones。
+        """
+        if self.recognition_mode.get() == "template" and self.template_lib is not None:
+            return read_board_template(image_rgb, geometry, self.template_lib)
+        return read_stones(image_rgb, geometry)
+
+    def _import_template_package(self) -> str:
+        """导入参照图包。返回 "ok"；"cancelled"（未选择任何文件夹）；"invalid"（加载失败）。"""
+        from tkinter import filedialog
+
+        folder = filedialog.askdirectory(
+            title="选择参照图包文件夹（含 meta.json 或 empty/black/white 子目录）"
+        )
+        if not folder:
+            return "cancelled"
+        try:
+            library = load_template_package(folder)
+        except ValueError as exc:
+            self._set_status("导入模板失败", str(exc))
+            return "invalid"
+        self.template_lib = library
+        self.recognition_mode.set("template")
+        folder_name = os.path.basename(folder.rstrip("\\/"))
+        self.template_folder_text.set(f"已导入：{folder_name}")
+        self.template_status_text.set(f"模板参数：{library.summary().replace(' ', '')}")
+        self._set_status(
+            "参照图包已导入",
+            f"{library.summary()}；识别方式已切换为模板匹配。",
+        )
+        return "ok"
+
+    def _recognition_mode_changed(self) -> None:
+        if self.recognition_mode.get() == "template":
+            if self.template_lib is None:
+                # 切换到模板匹配自动进入导入文件夹模式；导入失败/取消直接切回颜色阈值。
+                result = self._import_template_package()
+                if result != "ok":
+                    self.recognition_mode.set("color")
+                    self._recognition_mode_changed()
+                    if result == "cancelled":
+                        self.detail_text.set("导入失败")
+                    else:
+                        self.detail_text.set("导入文件夹内未找到 meta.json")
+            else:
+                self.template_status_text.set(f"模板参数：{self.template_lib.summary().replace(' ', '')}")
+        else:
+            # 切回颜色阈值：不保留已导入的文件夹；模板参数行冒号后空白。
+            self.template_lib = None
+            self.template_folder_text.set("未导入")
+            self.template_status_text.set("模板参数：")
+            self._set_status("识别方式：颜色阈值", "识别方式已切换为颜色阈值。")
 
     def calculate_move(self, quiet: bool = False) -> None:
         if not self.scan_screen(quiet=quiet):
@@ -990,6 +1111,10 @@ class GomokuApp:
         return self.auto_enabled.get()
 
     def _confirm_motion(self, event: tk.Event) -> None:
+        # 框选期间：未点击也显示绿色十字线并跟随鼠标；锚定后附加跟随正方形。
+        if self._selecting and self._pending_image is not None:
+            self._selection_motion(event)
+            return
         # 确认按钮点选与执子图标点选共用橙色圆点跟随（画布被 _display_image 清空后重建）。
         dot_id = None
         if self._confirm_point_mode:
@@ -1022,24 +1147,116 @@ class GomokuApp:
             self._pending_engine_result = None
             self._scan_failures = 0
             self._auto_suspended = True
-            self._set_status("正在手动框选棋盘", "自动模式保持开启；框选并识别通过后自动恢复点击。")
         else:
             self.auto_state.reset()
-            self._set_status("正在手动框选棋盘", "在左侧截图上从棋盘左上角拖到右下角；范围应包含完整网格。")
+        self._set_status("正在手动框选棋盘", "点击一个角，再点击对角；范围内应包含完整网格。")
         try:
             self._pending_image, self._pending_origin = self._capture_target()
         except OSError as exc:
             self._set_status("截图失败", str(exc))
             return
+        self._reset_selection_state()
         self._selecting = True
         self.scan = None
         self.suggestion = None
         self.canvas.configure(cursor="crosshair")
         self._display_image(self._pending_image, full=True)
-        if self._auto_suspended:
-            self._set_status("拖框选择棋盘", "在左侧截图上从棋盘左上角拖到右下角；自动模式保持开启，框选完成且识别通过后自动恢复点击。")
-        else:
-            self._set_status("拖框选择棋盘", "在左侧截图上从棋盘左上角拖到右下角；范围应包含完整网格。")
+        # 未点击时即显示绿色十字线：逻辑光标先放在画面中心，随鼠标移动更新。
+        height, width = self._pending_image.shape[:2]
+        self._selection_cursor = (width / 2.0, height / 2.0)
+        self._draw_selection_overlay()
+        self.canvas.focus_set()  # 保证方向键/回车可用（防止焦点丢失）
+        self._set_status("点击框选棋盘", "点击一个角，再点击对角；范围内应包含完整网格。")
+
+    def _reset_selection_state(self) -> None:
+        """重新框选/进入框选：清空上一轮的锚点、正方形与参考线（参考线不残留）。"""
+        self._selection_anchor = None
+        self._selection_square = None
+        self._selection_cursor = None
+        self._delete_selection_overlay()
+
+    def _delete_selection_overlay(self) -> None:
+        for item in (self._selection_id, self._xhair_h, self._xhair_v):
+            if item is not None:
+                try:
+                    self.canvas.delete(item)
+                except tk.TclError:
+                    pass
+        self._selection_id = None
+        self._xhair_h = None
+        self._xhair_v = None
+
+    def _image_to_canvas(self, x: float, y: float) -> tuple[float, float]:
+        if self._view_transform is None:
+            return 0.0, 0.0
+        scale, offset_x, offset_y, source_x, source_y = self._view_transform
+        return (x - source_x) * scale + offset_x, (y - source_y) * scale + offset_y
+
+    def _draw_selection_overlay(self) -> None:
+        """按当前图像坐标状态重画框选 overlay：正方形框 + 贯穿整个画布的橙色十字线。"""
+        if not self._selecting:
+            return
+        self._delete_selection_overlay()
+        if self._selection_square is not None:
+            x0, y0, x1, y1 = self._selection_square
+            cx0, cy0 = self._image_to_canvas(x0, y0)
+            cx1, cy1 = self._image_to_canvas(x1, y1)
+            self._selection_id = self.canvas.create_rectangle(
+                cx0, cy0, cx1, cy1, outline=self.COLORS["accent"], width=2
+            )
+        if self._selection_cursor is not None:
+            cx, cy = self._image_to_canvas(*self._selection_cursor)
+            width = max(1, self.canvas.winfo_width())
+            height = max(1, self.canvas.winfo_height())
+            self._xhair_h = self.canvas.create_line(
+                0, cy, width, cy, fill="#4ADE80", dash=(6, 4), tags=("xhair",)
+            )
+            self._xhair_v = self.canvas.create_line(
+                cx, 0, cx, height, fill="#4ADE80", dash=(6, 4), tags=("xhair",)
+            )
+
+    def _selection_motion(self, event: tk.Event) -> None:
+        if not self._selecting or self._pending_image is None:
+            return
+        img_x, img_y = self._canvas_to_image(event.x, event.y)
+        self._selection_cursor = (img_x, img_y)
+        if self._selection_anchor is not None:
+            box = make_square_box(self._selection_anchor, self._selection_cursor)
+            if box is not None:
+                self._selection_square = box
+        self._draw_selection_overlay()
+
+    def _selection_key(self, event: tk.Event) -> str:
+        """方向键按图像坐标微调逻辑光标（Shift=10px）；回车前可反复微调。"""
+        if not self._selecting or self._pending_image is None:
+            return ""
+        step = 10 if (event.state & 0x0001) else 1
+        cx, cy = self._selection_cursor or self._selection_anchor or (0, 0)
+        if event.keysym == "Left":
+            cx -= step
+        elif event.keysym == "Right":
+            cx += step
+        elif event.keysym == "Up":
+            cy -= step
+        elif event.keysym == "Down":
+            cy += step
+        height, width = self._pending_image.shape[:2]
+        cx = max(0, min(width - 1, int(cx)))
+        cy = max(0, min(height - 1, int(cy)))
+        self._selection_cursor = (cx, cy)
+        if self._selection_anchor is not None:
+            box = make_square_box(self._selection_anchor, self._selection_cursor)
+            if box is not None:
+                self._selection_square = box
+        self._draw_selection_overlay()
+        return "break"
+
+    def _selection_return(self, event: tk.Event) -> str:
+        """回车 = 左键：第一击设角，第二击完成框选（防止人手按左键导致鼠标错位）。"""
+        if not self._selecting or self._pending_image is None or self._selection_anchor is None:
+            return ""
+        self._finish_selection(make_square_box(self._selection_anchor, self._selection_cursor))
+        return "break"
 
     def _selection_press(self, event: tk.Event) -> None:
         if self._stone_point_mode:
@@ -1080,43 +1297,49 @@ class GomokuApp:
                 + ("自动模式已恢复运行。" if auto_on else "自动模式保持关闭。"),
             )
             return
-        if not self._selecting:
+        if not self._selecting or self._pending_image is None:
             return
-        self._selection_start = (event.x, event.y)
-        if self._selection_id is not None:
-            self.canvas.delete(self._selection_id)
-        self._selection_id = self.canvas.create_rectangle(
-            event.x,
-            event.y,
-            event.x,
-            event.y,
-            outline=self.COLORS["accent"],
-            width=2,
-        )
+        self.canvas.focus_set()  # 点击画布时重新抢焦点，保证方向键/回车可用
+        img_x, img_y = self._canvas_to_image(event.x, event.y)
+        if self._selection_anchor is None:
+            # 第一击：清掉旧参考线，锚定该角；正方形与十字线随后续移动跟随。
+            self._selection_anchor = (img_x, img_y)
+            self._selection_square = None
+            self._selection_cursor = (img_x, img_y)
+            self._draw_selection_overlay()
+            self._set_status("已选定第一个角", "移动鼠标（或方向键微调）后，点击/回车选定对角。")
+        else:
+            # 第二击：完成框选并识别。
+            self._finish_selection(make_square_box(self._selection_anchor, (img_x, img_y)))
 
     def _selection_drag(self, event: tk.Event) -> None:
-        if not self._selecting or self._selection_start is None or self._selection_id is None:
-            return
-        self.canvas.coords(self._selection_id, *self._selection_start, event.x, event.y)
+        # 点击式拉框不使用拖动；保留空实现以兼容旧绑定。
+        return
 
     def _canvas_to_image(self, x: float, y: float) -> tuple[int, int]:
         if self._view_transform is None:
             return 0, 0
         scale, offset_x, offset_y, source_x, source_y = self._view_transform
-        return int(round((x - offset_x) / scale + source_x)), int(round((y - offset_y) / scale + source_y))
+        img_x = int(round((x - offset_x) / scale + source_x))
+        img_y = int(round((y - offset_y) / scale + source_y))
+        if self._pending_image is not None:
+            height, width = self._pending_image.shape[:2]
+            img_x = max(0, min(width - 1, img_x))
+            img_y = max(0, min(height - 1, img_y))
+        return img_x, img_y
 
-    def _selection_release(self, event: tk.Event) -> None:
-        if not self._selecting or self._selection_start is None or self._pending_image is None:
+    def _finish_selection(self, box: tuple[int, int, int, int] | None) -> None:
+        if box is None or self._pending_image is None:
             return
-        start = self._canvas_to_image(*self._selection_start)
-        end = self._canvas_to_image(event.x, event.y)
+        self._selection_square = box
+        self._draw_selection_overlay()  # 先显示最终正方形供核对
         try:
-            geometry = geometry_from_rect(self._pending_image, (*start, *end), self.board_size.get())
+            geometry = geometry_from_rect(self._pending_image, box, self.board_size.get())
             self._locked_geometry = with_screen_origin(geometry, (0, 0))
             self._locked_capture_shape = self._pending_image.shape[:2]
             screen_geometry = with_screen_origin(self._locked_geometry, self._pending_origin)
             liveness = grid_liveness(self._pending_image, screen_geometry)
-            board, stone_confidence = read_stones(self._pending_image, screen_geometry)
+            board, stone_confidence = self._read_board(self._pending_image, screen_geometry)
             self.scan = ScanResult(
                 self._pending_image,
                 screen_geometry,
@@ -1127,6 +1350,7 @@ class GomokuApp:
             self.suggestion = None
             self._selecting = False
             self.canvas.configure(cursor="arrow")
+            self._delete_selection_overlay()
             self._show_scan()
             self._update_stats()
             if liveness < self.GRID_LIVENESS_THRESHOLD:
@@ -1138,14 +1362,23 @@ class GomokuApp:
                 self._set_status("手动校准完成", f"网格置信度 {geometry.confidence:.0%}。请核对棋子预览。")
         except (DetectionError, ValueError) as exc:
             self._set_status("框选无效", str(exc))
+            self._selecting = True
+            self.canvas.configure(cursor="crosshair")
+            self._reset_selection_state()
+            return
         finally:
-            self._selection_start = None
-            self._selection_id = None
+            self._selection_anchor = None
+            self._selection_square = None
+            self._selection_cursor = None
             # 框选结束（无论成功与否）恢复自动采样；自动模式保持开启。
             if self._auto_suspended:
                 self._auto_suspended = False
                 if self.auto_enabled.get() and self._auto_job is None:
                     self._schedule_auto(80)
+
+    def _selection_release(self, event: tk.Event) -> None:
+        # 点击式拉框在第二击/回车时即完成；release 无需处理（保留空实现兼容旧绑定）。
+        return
 
     def _annotated_image(self) -> np.ndarray:
         assert self.scan is not None
@@ -1204,6 +1437,8 @@ class GomokuApp:
         self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self._photo)
         self._view_transform = (scale, offset_x, offset_y, source_x, source_y)
         self._draw_stone_rect()  # 画面刷新后持续标注执子图标方框（黑/白）
+        if self._selecting:
+            self._draw_selection_overlay()  # 画面重建后恢复框选 overlay（正方形 + 贯穿十字线）
 
     def _click_permission_changed(self) -> None:
         # 关闭点击权限不再停用自动模式：自动保持开启，仅不执行点击，重新勾选后自动恢复。

@@ -11,8 +11,10 @@ This application targets Windows 10/11 and Python 3.11.
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 $env:PYTHONPATH = (Get-Location).Path
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+py -3.11 app.py --smoke-test
 ```
+
+> 本发布版已移除开发期单元测试目录（`tests/`），上述命令仅做启动自检。
 
 ## Pull requests
 
@@ -22,7 +24,7 @@ $env:PYTHONPATH = (Get-Location).Path
 - Never bypass turn validation, grid liveness, target-window checks, or the
   post-click visual confirmation state.
 - Do not add screenshots, logs, or fixtures containing personal information.
-- Run the full test suite and `python -m compileall -q app.py gomoku_assistant tests`.
+- Run `python -m compileall -q app.py gomoku_assistant` before opening a PR.
 
 ## Updating Rapfi
 
