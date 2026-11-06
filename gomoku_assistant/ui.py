@@ -707,20 +707,41 @@ class GomokuApp:
                 )
                 return False
             if stone_min < self._stone_threshold():
-                self._set_status(
-                    "棋子识别置信度不足",
-                    f"最低交点棋子置信度 {stone_min:.0%}，低于棋子门槛 {self._stone_threshold():.0%}（滑块值的 60%）。请重新识别或手动框选。",
-                )
+                if self._template_mode_active():
+                    self._set_status(
+                        "模板匹配相似度不足",
+                        f"模板匹配最低交点相似度 {stone_min:.0%}，低于门槛 {self._stone_threshold():.0%}（滑块值的 60%）；"
+                        "请核对参照图包是否覆盖该棋盘风格/分辨率，或切回颜色阈值对比。",
+                    )
+                else:
+                    self._set_status(
+                        "棋子识别置信度不足",
+                        f"最低交点棋子置信度 {stone_min:.0%}，低于棋子门槛 {self._stone_threshold():.0%}（滑块值的 60%）。请重新识别或手动框选。",
+                    )
                 return False
             if not quiet:
-                self._set_status(
-                    "棋盘已识别",
-                    f"已锁定目标窗口网格；定位 {geometry.confidence:.0%}，最低交点 {stone_min:.0%}（棋子门槛 {self._stone_threshold():.0%}）。",
-                )
+                if self._template_mode_active():
+                    self._set_status(
+                        "棋盘已识别",
+                        f"已锁定目标窗口网格（模板匹配）；定位 {geometry.confidence:.0%}，最低交点相似度 {stone_min:.0%}（门槛 {self._stone_threshold():.0%}）。",
+                    )
+                else:
+                    self._set_status(
+                        "棋盘已识别",
+                        f"已锁定目标窗口网格（颜色阈值）；定位 {geometry.confidence:.0%}，最低交点 {stone_min:.0%}（棋子门槛 {self._stone_threshold():.0%}）。",
+                    )
             return True
         except (DetectionError, OSError, ValueError) as exc:
             self._set_status("自动识别失败" if quiet else "识别失败", str(exc))
             return False
+
+    def _template_mode_active(self) -> bool:
+        """当前是否真的走模板匹配（识别方式为模板匹配且已导入图包）。
+
+        未导入图包时 _read_board 会回退颜色阈值，此时提示必须按颜色阈值口径，
+        否则会把颜色阈值的失败说成"模板匹配失败"，反而更难定位。
+        """
+        return self.recognition_mode.get() == "template" and self.template_lib is not None
 
     def _read_board(self, image_rgb: np.ndarray, geometry) -> tuple[np.ndarray, np.ndarray]:
         """按当前识别方式读取棋盘。
@@ -790,7 +811,14 @@ class GomokuApp:
             self._set_status("暂不计算", "棋盘定位置信度未达到门槛，请先校准。")
             return None
         if np.min(self.scan.stone_confidence) < self._stone_threshold():
-            self._set_status("暂不计算", "棋子置信度未达到门槛（滑块值的 60%），请先校准。")
+            if self._template_mode_active():
+                self._set_status(
+                    "暂不计算",
+                    f"模板匹配最低交点相似度 {float(np.min(self.scan.stone_confidence)):.0%} 未达门槛（滑块值的 60%），"
+                    "请核对参照图包或切换识别方式。",
+                )
+            else:
+                self._set_status("暂不计算", "棋子置信度未达到门槛（滑块值的 60%），请先校准。")
             return None
         if self.engine.winner(self.scan.board) != EMPTY:
             self._set_status("棋局已结束", "检测到棋盘上已经有五连。")
@@ -847,11 +875,18 @@ class GomokuApp:
         if self.scan.board[move.row, move.col] != EMPTY:
             self._set_status("目标格非空", "识别结果已变化，取消本次点击。")
             return False
-        if float(self.scan.stone_confidence[move.row, move.col]) < self._stone_threshold():
-            self._set_status(
-                "目标格识别不可靠",
-                f"目标交点棋子置信度 {float(self.scan.stone_confidence[move.row, move.col]):.0%} 不足（门槛为滑块值的 60%），取消本次点击。",
-            )
+        target_conf = float(self.scan.stone_confidence[move.row, move.col])
+        if target_conf < self._stone_threshold():
+            if self._template_mode_active():
+                self._set_status(
+                    "目标格识别不可靠",
+                    f"目标交点模板相似度 {target_conf:.0%} 不足（门槛为滑块值的 60%），取消本次点击。",
+                )
+            else:
+                self._set_status(
+                    "目标格识别不可靠",
+                    f"目标交点棋子置信度 {target_conf:.0%} 不足（门槛为滑块值的 60%），取消本次点击。",
+                )
             return False
         if time.monotonic() - self._last_click_at < 0.8:
             self._set_status("点击冷却中", "为防止重复落子，本次请求已拦截。")

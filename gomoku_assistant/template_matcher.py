@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from .detector import crop_cell
 from .engine import BLACK, EMPTY, WHITE
 
 # 模板类目键 -> 棋盘状态常量（与 engine.py 一致）
@@ -246,9 +247,7 @@ def read_board_template(
             xf = float(geometry.x_lines[col])
             x0 = int(round(xf - half))
             x1 = int(round(xf + half))
-            if x0 < 0 or y0 < 0 or x1 > image_rgb.shape[1] or y1 > image_rgb.shape[0]:
-                continue
-            patch = image_rgb[y0:y1, x0:x1]
+            patch = crop_cell(image_rgb, x0, y0, x1, y1)
             if patch.shape[0] < 2 or patch.shape[1] < 2:
                 continue
             label, score, _ = classify_patch(patch, lib)

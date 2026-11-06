@@ -13,6 +13,36 @@ class DetectionError(RuntimeError):
     pass
 
 
+def crop_cell(image: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
+    """裁取交点小图；框越过图像边界时用可见区中位色补齐。
+
+    棋盘通常贴着窗口边缘，最外圈交点的裁剪框必然越过图像边界。旧逻辑遇到
+    越界直接 continue，这些交点的置信度就停在初始值 0，于是"最低交点置信度"
+    整盘被判成 0——识别完全正确也会被门槛拒绝。这里先裁可见部分，越界部分
+    用"可见像素的中位色"填充，返回尺寸恒为 (y1-y0, x1-x0)，让最外圈也参与判读。
+
+    填充色取中位色而不是复制最近边缘像素：棋盘线正好压在图像边界时，边缘那
+    一列本身就是网格线色，复制会把半个格子涂成深色，凭空造出一块"黑棋"。
+    """
+    h, w = image.shape[:2]
+    ys = min(max(y0, 0), h - 1)
+    ye = min(max(y1, ys + 1), h)
+    xs = min(max(x0, 0), w - 1)
+    xe = min(max(x1, xs + 1), w)
+    src = image[ys:ye, xs:xe]
+    top = max(0, ys - y0)
+    left = max(0, xs - x0)
+    bottom = max(0, y1 - ye)
+    right = max(0, x1 - xe)
+    if top or bottom or left or right:
+        if src.ndim == 3:
+            fill = tuple(int(v) for v in np.median(src.reshape(-1, src.shape[2]), axis=0))
+        else:
+            fill = int(np.median(src))
+        src = cv2.copyMakeBorder(src, top, bottom, left, right, cv2.BORDER_CONSTANT, value=fill)
+    return src
+
+
 def _dedupe_rectangles(rectangles: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
     result: list[tuple[int, int, int, int]] = []
     for rect in sorted(rectangles, key=lambda r: r[2] * r[3], reverse=True):
@@ -806,10 +836,8 @@ def read_stones(image_rgb: np.ndarray, geometry: BoardGeometry) -> tuple[np.ndar
             x, y = int(round(float(xf))), int(round(float(yf)))
             x1, x2 = x - outer_radius, x + outer_radius + 1
             y1, y2 = y - outer_radius, y + outer_radius + 1
-            if x1 < 0 or y1 < 0 or x2 > gray.shape[1] or y2 > gray.shape[0]:
-                continue
-            patch_gray = gray[y1:y2, x1:x2]
-            patch_hsv = hsv[y1:y2, x1:x2]
+            patch_gray = crop_cell(gray, x1, y1, x2, y2)
+            patch_hsv = crop_cell(hsv, x1, y1, x2, y2)
             sat = patch_hsv[:, :, 1].astype(np.int16)
             val = patch_hsv[:, :, 2].astype(np.int16)
 
