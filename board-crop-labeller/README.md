@@ -179,7 +179,7 @@ cd /d D:\opencv-gomoku\board-crop-labeller
 
 ```bat
 cd /d D:\opencv-gomoku\board-crop-labeller
-.venv\Scripts\python.exe gui_smoke.py            :: GUI 全流程冒烟（多图/键盘/十字线）
+.venv\Scripts\python.exe gui_smoke.py            :: 全流程冒烟（多图/键盘/十字线 + 提示行文案 + 方向键步长）
 .venv\Scripts\python.exe make_demo.py            :: 重新生成示例输出
 ```
 

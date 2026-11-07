@@ -130,10 +130,16 @@ $env:PYTHONPATH = (Get-Location).Path
 py -3.11 -m pip install -r requirements.txt
 py -3.11 -m compileall -q app.py gomoku_assistant
 py -3.11 app.py --smoke-test
+py -3.11 smoke_ui.py
+py -3.11 smoke_recognize.py
 ```
 
-> 本项目发布版已移除开发期单元测试目录（`tests/`），运行软件不需要它；
-> 自检请用上面的 `--smoke-test`。
+> 本项目发布版已移除开发期单元测试目录（`tests/`），运行软件不需要它。
+> 自检分三级：`--smoke-test` 只证明窗口能创建、依赖齐全；
+> `smoke_ui.py` 校验 UI 口径（窗口 902x990、大标题、默认识别方式、模板灰字与
+> 模板参数文案、模式切换提示、框选十字线）；
+> `smoke_recognize.py` 用合成棋盘校验两种识别方式在最外圈交点贴边时的判读与
+> 置信度（防止越界格被判 0 分、整盘被门槛拒绝）。均以 EXIT=0 通过。
 
 提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请按
 [SECURITY.md](SECURITY.md) 私下报告。

@@ -25,6 +25,7 @@
 依赖：Pillow（pip install pillow），tkinter（Python 自带）。
 """
 import os
+import sys
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -32,6 +33,10 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 import crop_math
+import drop_files
+
+# 允许导入的图片扩展名（导入对话框与拖拽共用同一套判断）
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff", ".jfif")
 
 GRID_N = crop_math.GRID_N
 THUMB = 44  # 小图缩略图边长（像素）
@@ -95,7 +100,39 @@ class App:
         self.thumb_photos = []   # 缩略图 PhotoImage 引用（防 GC）
 
         self._build_ui()
-        self.status.set("请先导入一张或多张五子棋截图。")
+        # 允许把图片直接拖进窗口导入（Win32 拖放，打包后同样有效）
+        self.drop_enabled = drop_files.enable_file_drop(self.root, self.on_drop_paths)
+        # 窗口左上角/任务栏图标：换掉 Tk 默认的羽毛图标
+        self.window_icon_path = self._set_window_icon()
+        self.status.set("请先导入一张或多张五子棋截图（也可以直接把图片拖进窗口）。")
+
+    # ------------------------------------------------------------------
+    # 窗口图标
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _icon_candidates():
+        """app.ico 的候选位置：打包内嵌目录 -> 源码目录 -> exe 同目录。"""
+        candidates = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, "app.ico"))
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico"))
+        if getattr(sys, "frozen", False):
+            candidates.append(os.path.join(os.path.dirname(sys.executable), "app.ico"))
+        return candidates
+
+    def _set_window_icon(self):
+        """把 Tk 默认的羽毛图标换成交点图标；返回实际生效的 ico 路径（找不到返回 None）。"""
+        for path in self._icon_candidates():
+            if not os.path.isfile(path):
+                continue
+            try:
+                self.root.iconbitmap(path)
+                self.root.iconbitmap(default=path)  # 之后弹出的对话框/顶层窗口也用同一个
+            except tk.TclError:
+                continue
+            return path
+        return None
 
     # ------------------------------------------------------------------
     # UI 搭建
@@ -130,7 +167,7 @@ class App:
                    command=self.clear_and_reselect).pack(side="left")
         ttk.Button(bar, text="导出分割线预览图",
                    command=self.export_preview).pack(side="left", padx=(6, 0))
-        ttk.Label(bar, text="滚轮=缩放  右键按住拖动=平移  左键/回车=选定框角  方向键可用",
+        ttk.Label(bar, text="滚轮=缩放  右键按住拖动=平移  左键/回车=选定框角  方向键可用  拖入图片=导入",
                   foreground="#555").pack(side="right")
 
         self.canvas = tk.Canvas(tab_board, bg="#202020", highlightthickness=0)
@@ -211,14 +248,30 @@ class App:
             initialdir=self.base_dir)
         if not paths:
             return
+        self.add_paths(paths)
+
+    def on_drop_paths(self, paths):
+        """拖拽回调：把拖进窗口的图片按导入流程加入会话（中文路径原样可用）。"""
+        self.add_paths(paths, source="拖入")
+
+    def add_paths(self, paths, source="导入"):
+        """把给定的图片路径加入多图会话；打不开的文件最后汇总提示一次。"""
+        images = [p for p in paths if p.lower().endswith(IMAGE_EXTENSIONS)]
+        if not images:
+            if source == "拖入":
+                self.status.set("拖入的内容里没有可识别的图片（支持 PNG/JPG/BMP/WEBP）。")
+            else:
+                self.status.set("未选择有效的图片文件。")
+            return
         added = 0
-        for path in paths:
+        failed = []
+        for path in images:
             try:
                 src = Image.open(path)
                 src.load()
                 src = src.convert("RGB")
             except Exception as exc:
-                messagebox.showerror("无法打开图片", f"{path}\n\n{exc}")
+                failed.append(f"{os.path.basename(path)}：{exc}")
                 continue
             self.sources.append({
                 "path": path,
@@ -230,10 +283,14 @@ class App:
                 "selected": _empty_selected(),
             })
             added += 1
-        if added == 0:
-            return
-        self.cur = len(self.sources) - 1
-        self.show_source(self.cur)
+        if added:
+            self.cur = len(self.sources) - 1
+            self.show_source(self.cur)
+            self.status.set(f"{source} {added} 张，当前共 {len(self.sources)} 张。")
+        if failed:
+            head = "\n".join(failed[:8])
+            tail = "" if len(failed) <= 8 else f"\n…另有 {len(failed) - 8} 个文件打不开"
+            messagebox.showerror("无法打开图片", head + tail)
 
     def show_source(self, idx):
         """切换到第 idx 张图，把它的数据同步为当前视图。"""

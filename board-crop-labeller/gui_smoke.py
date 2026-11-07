@@ -10,11 +10,18 @@
 - 格子固定尺寸不随选择变化
 - 每张图分类状态相互隔离
 """
+import ctypes
+import os
+import shutil
+import struct
+import time
 import tkinter as tk
+from ctypes import wintypes
 from types import SimpleNamespace
 
 from PIL import Image
 
+import drop_files
 import main
 
 root = tk.Tk()
@@ -181,6 +188,106 @@ assert app.thumbs == [], "225 小图应清空"
 assert app.crops is None and app.sources[0]["box"] is None
 assert app.notebook.index(app.notebook.select()) == 0, "应切回页①"
 
+# ---- 页①提示行口径：文案固定，改字/改空格都要被抓出来 ----
+EXPECTED_HINT = "滚轮=缩放  右键按住拖动=平移  左键/回车=选定框角  方向键可用  拖入图片=导入"
+hints = [w for w in bar.winfo_children()
+         if w.winfo_class() == "TLabel" and w.cget("text").startswith("滚轮=缩放")]
+assert len(hints) == 1, "页①应存在一行操作提示"
+assert hints[0].cget("text") == EXPECTED_HINT, \
+    f"页①提示行文案不对：{hints[0].cget('text')!r}"
+
+# ---- 方向键步长：默认 0.5 图像像素，按住 Shift 为 5 ----
+app.show_source(0)
+app.cursor_cv = None
+app.on_key(SimpleNamespace(keysym="Right", state=0))  # 首次按键把逻辑光标放到画面中心
+base_x = app.cv2img(app.cursor_cv)[0]
+app.on_key(SimpleNamespace(keysym="Right", state=0))
+plain_step = app.cv2img(app.cursor_cv)[0] - base_x
+assert abs(plain_step - 0.5) < 1e-6, f"默认步长应为 0.5 图像像素，实际 {plain_step}"
+plain_x = app.cv2img(app.cursor_cv)[0]
+app.on_key(SimpleNamespace(keysym="Right", state=0x0001))  # Shift
+shift_step = app.cv2img(app.cursor_cv)[0] - plain_x
+assert abs(shift_step - 5) < 1e-6, f"Shift 步长应为 5 图像像素，实际 {shift_step}"
+
+# ---- 拖拽导入：真实投递 WM_DROPFILES 消息，验证“窗口过程 -> 解码 -> 加入会话” ----
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = wintypes.HANDLE
+kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+
+
+def _pump(seconds):
+    """跑一会儿 Tk 事件循环，让 after() 轮询把拖放队列派发出去。"""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        root.update()
+        time.sleep(0.02)
+
+
+drag_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_drag_smoke")
+os.makedirs(drag_dir, exist_ok=True)
+drag_path = os.path.join(drag_dir, "拖拽 测试 中文 图.png")
+Image.new("RGB", (800, 800), (200, 220, 240)).save(drag_path)
+
+assert app.drop_enabled, "启动时应已注册拖放"
+_pump(0.3)  # 等轮询把注册迁移到 Tk 真正创建后的顶层句柄
+hwnd = drop_files.window_handle(root)
+assert hwnd, "应能取到顶层窗口句柄"
+assert hwnd in drop_files._TARGETS, f"拖放注册应挂在当前顶层句柄（{hex(hwnd)}）"
+
+# ---- 窗口图标：设置后窗口应持有图标句柄（未设置时 WM_GETICON 返回 0）----
+user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.SendMessageW.restype = ctypes.c_ssize_t
+assert app.window_icon_path, "应找到并应用 app.ico"
+assert os.path.basename(app.window_icon_path).lower() == "app.ico", \
+    f"窗口图标应指向 app.ico（实际 {app.window_icon_path}）"
+icon_small = user32.SendMessageW(hwnd, 0x007F, 0, 0)  # WM_GETICON, ICON_SMALL
+icon_big = user32.SendMessageW(hwnd, 0x007F, 1, 0)    # WM_GETICON, ICON_BIG
+assert icon_small and icon_big, \
+    f"标题栏/任务栏图标应已设置（small={icon_small} big={icon_big}）"
+
+# DROPFILES 头：pFiles=20, pt=(0,0), fNC=0, fWide=1（宽字符 = 中文路径原样）
+DROPFILES_HEAD = struct.pack("<Iiiii", 20, 0, 0, 0, 1)
+
+
+def drop_files_into_window(paths):
+    """把一组路径打成 HDROP 投递给窗口，等价于用户真实拖放。"""
+    names = ("\0".join(paths) + "\0\0").encode("utf-16-le")
+    payload = DROPFILES_HEAD + names
+    hdrop = kernel32.GlobalAlloc(0x0042, len(payload))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+    assert hdrop, "GlobalAlloc 失败"
+    ptr = kernel32.GlobalLock(hdrop)
+    assert ptr, "GlobalLock 失败"
+    ctypes.memmove(ptr, payload, len(payload))
+    kernel32.GlobalUnlock(hdrop)
+    user32.PostMessageW(hwnd, 0x0233, int(hdrop), 0)  # WM_DROPFILES
+    _pump(0.5)
+
+
+before = len(app.sources)
+drop_files_into_window([drag_path])
+assert len(app.sources) == before + 1, f"拖拽应新增 1 张图（实际 {len(app.sources)}）"
+assert app.sources[-1]["path"] == drag_path, "拖入路径应原样保留（含中文与空格）"
+assert app.sources[-1]["src"].size == (800, 800), "拖入的图应已解码"
+assert app.cur == len(app.sources) - 1, "应切到刚拖入的图"
+assert app.box is None, "新拖入的图应等待拉框"
+
+# 拖入非图片：不加入会话，只在状态栏提示
+txt_path = os.path.join(drag_dir, "说明 文本.txt")
+with open(txt_path, "w", encoding="utf-8") as fh:
+    fh.write("not an image")
+before2 = len(app.sources)
+drop_files_into_window([txt_path])
+assert len(app.sources) == before2, "非图片文件不应加入会话"
+assert "没有可识别的图片" in app.status.get(), f"非图片应提示（实际 {app.status.get()!r}）"
+
+drop_files.disable_file_drop(root)
+shutil.rmtree(drag_dir, ignore_errors=True)
+
 root.update()
 root.destroy()
-print("GUI pipeline smoke OK (multi-image + keyboard + crosshair)")
+print("GUI pipeline smoke OK (multi-image + keyboard + crosshair + drop)")

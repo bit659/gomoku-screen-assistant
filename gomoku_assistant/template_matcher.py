@@ -50,8 +50,20 @@ def make_square_box(anchor: tuple[float, float], current: tuple[float, float]) -
 
 
 def _read_image(path: str) -> np.ndarray:
-    """读取图片为 RGB 数组；失败抛 ValueError。"""
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    """读取图片为 RGB 数组；失败抛 ValueError。
+
+    这里不用 cv2.imread：它在 Windows 上不认非 ASCII 路径，图包放在含中文的
+    文件夹里会直接返回 None（表现为“无法读取模板图片”）。改成用内建 open
+    读字节再交给 cv2.imdecode，路径解析走 Python，中文/空格都正常。
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise ValueError(f"无法读取模板图片：{path}（{exc}）") from exc
+    if not data:
+        raise ValueError(f"无法读取模板图片：{path}（文件为空）")
+    img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError(f"无法读取模板图片：{path}")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
